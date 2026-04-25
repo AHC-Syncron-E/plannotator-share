@@ -1,0 +1,119 @@
+name: Update Plannotator Share Portal
+
+on:
+  schedule:
+    # Run daily at 08:00 UTC
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+    inputs:
+      force_version:
+        description: "Force rebuild of a specific version (e.g. 0.19.2). Leave blank to auto-detect latest."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Get current deployed version
+        id: current
+        run: echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Get latest upstream release tag
+        id: latest
+        run: |
+          if [ -n "${{ inputs.force_version }}" ]; then
+            echo "version=${{ inputs.force_version }}" >> "$GITHUB_OUTPUT"
+            echo "Forced version: ${{ inputs.force_version }}"
+          else
+            LATEST=$(git ls-remote --tags https://github.com/backnotprop/plannotator.git \
+              | awk '{print $2}' \
+              | grep -oP 'refs/tags/v\K[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V \
+              | tail -1)
+            echo "version=$LATEST" >> "$GITHUB_OUTPUT"
+            echo "Latest upstream version: $LATEST"
+          fi
+
+      - name: Compare versions
+        id: compare
+        run: |
+          CURRENT="${{ steps.current.outputs.version }}"
+          LATEST="${{ steps.latest.outputs.version }}"
+          echo "Current: $CURRENT"
+          echo "Latest:  $LATEST"
+          if [ "$CURRENT" = "$LATEST" ]; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+            echo "Already up to date."
+          else
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+            echo "Update available: $CURRENT -> $LATEST"
+          fi
+
+      - name: Clone upstream source
+        if: steps.compare.outputs.up_to_date == 'false'
+        run: |
+          git clone --depth 1 --branch "v${{ steps.latest.outputs.version }}" \
+            https://github.com/backnotprop/plannotator.git /tmp/plannotator
+
+      - name: Install bun
+        if: steps.compare.outputs.up_to_date == 'false'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies and build portal
+        if: steps.compare.outputs.up_to_date == 'false'
+        run: |
+          cd /tmp/plannotator
+          bun install
+          cd apps/portal
+          npx vite build --base=/plannotator-share/
+
+      - name: Replace portal files
+        if: steps.compare.outputs.up_to_date == 'false'
+        run: |
+          # Remove old content (keep .git, .github, README.md, VERSION)
+          rm -rf assets index.html 404.html .nojekyll
+
+          # Copy new build output
+          cp -r /tmp/plannotator/apps/portal/dist/* .
+
+          # Re-add .nojekyll for GitHub Pages
+          touch .nojekyll
+
+          # Copy index.html as 404.html for SPA routing
+          cp index.html 404.html
+
+      - name: Patch default share URL
+        if: steps.compare.outputs.up_to_date == 'false'
+        run: |
+          # Replace hardcoded share.plannotator.ai with our self-hosted URL
+          sed -i 's|https://share.plannotator.ai|https://ahc-syncron-e.github.io/plannotator-share|g' assets/index-*.js
+
+          # Verify replacement
+          COUNT=$(grep -c 'share.plannotator.ai' assets/index-*.js || true)
+          if [ "$COUNT" -ne 0 ]; then
+            echo "ERROR: share.plannotator.ai still found in bundle after patching"
+            exit 1
+          fi
+          echo "Share URL patched successfully."
+
+      - name: Update VERSION file
+        if: steps.compare.outputs.up_to_date == 'false'
+        run: echo "${{ steps.latest.outputs.version }}" > VERSION
+
+      - name: Commit and push
+        if: steps.compare.outputs.up_to_date == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Deploy plannotator share portal v${{ steps.latest.outputs.version }}"
+          git push
